@@ -11,6 +11,143 @@ from std_srvs.srv import Empty
 from cv_bridge import CvBridge
 import cv2
 import collections
+from my_turtlebot_package.rrt_star import RRTStar
+import matplotlib.pyplot as plt
+
+
+def slam_to_grid_map(slam_map, threshold=128):
+
+    grid_map = np.where(slam_map < threshold, 1, 0)  
+    num_obstacles = np.count_nonzero(grid_map == 1)
+
+    # print(num_obstacles)
+    
+    # Визуализация grid_map
+    # plt.figure(figsize=(8, 8))
+    # plt.imshow(grid_map, cmap='gray')
+    # plt.title(f'Grid Map с порогом {threshold}')
+    # plt.axis('off')
+    # plt.show()
+    
+    return grid_map
+
+def world_to_map(world_coords, resolution, origin, map_offset, map_shape):
+    """
+    Преобразует мировые координаты в пиксельные, учитывая смещение
+    и возможный переворот карты SLAM.
+
+    Параметры:
+      world_coords: (x_world, y_world) – мировые координаты
+      resolution: масштаб (размер одного пикселя в мировых единицах)
+      origin: мировые координаты начала карты (нижний левый угол SLAM)
+      map_offset: (offset_x, offset_y) – сдвиг, чтобы центрировать карту
+      map_shape: (map_height, map_width) – размеры карты в пикселях
+    
+    Возвращает:
+      (x_map, y_map): координаты в пиксельной системе
+    """
+    x_world, y_world = world_coords
+
+    # Перевод в пиксельные координаты
+    x_map = int((x_world - origin[0]) / resolution) + map_offset[0]
+    y_map = int((y_world - origin[1]) / resolution) + map_offset[1]
+
+    # Переворачиваем Y, если SLAM-карта инвертирована
+    y_map = map_shape[0] - y_map - 1
+
+    # Ограничиваем координаты
+    x_map = max(0, min(x_map, map_shape[1] - 1))
+    y_map = max(0, min(y_map, map_shape[0] - 1))
+
+    return (x_map, y_map)
+
+def path(state, goal, grid_map, map_resolution = 0.05, map_origin = (-4.86, -7.36)):
+    
+    state_world = state # Текущая позиция в мировых координатах
+    goal_world = goal  # Цель в мировых координатах
+
+    map_offset = (45, 15)  # Смещение координат
+    map_shape = grid_map.shape  # (высота, ширина) карты
+
+    state_pixel = world_to_map(state_world, map_resolution, map_origin, map_offset, map_shape)
+    goal_pixel = world_to_map(goal_world, map_resolution, map_origin, map_offset, map_shape)
+    # print(goal_pixel)
+
+    # print(state_pixel)
+    # print(goal_pixel)
+
+    rrt_star = RRTStar(state_pixel, goal_pixel, grid_map)
+    optimal_path = rrt_star.plan()
+    # print(optimal_path)
+
+    # optimal_path = [map_to_world(p, map_resolution, map_origin) for p in optimal_path]
+
+    if optimal_path is None:
+        print("Путь не найден")
+    else:
+        print("Найденный путь:")
+        print(optimal_path)
+        
+        # Визуализация результатов:
+        plt.figure(figsize=(8, 8))
+        plt.imshow(grid_map, cmap='gray')
+        
+        # Отрисовываем все узлы дерева
+        for node in rrt_star.node_list:
+            if node.parent is not None:
+                p1 = node.point
+                p2 = node.parent.point
+                plt.plot([p1[0], p2[0]], [p1[1], p2[1]], "-g")
+                
+        # Отрисовываем найденный путь
+        path_x = [p[0] for p in optimal_path]
+        path_y = [p[1] for p in optimal_path]
+        plt.plot(path_x, path_y, "-r", linewidth=2)
+        
+        plt.scatter(state_pixel[0], state_pixel[1], color="blue", s=100, label="Старт")
+        plt.scatter(goal_pixel[0], goal_pixel[1], color="magenta", s=100, label="Цель")
+        plt.legend()
+        plt.title("RRT*")
+        plt.show()
+    return optimal_path
+
+def generate_potential_field(grid_map, goal, path_points, k_att=5.0, k_rep=50.0, d0=1.5, scale_factor=0.1):
+    """
+    Улучшенная версия генерации потенциального поля.
+    Теперь отталкивающие силы положительные, притягивающие - отрицательные.
+    Открытые области карты теперь нейтральны.
+    """
+    height, width = grid_map.shape
+    y_coords, x_coords = np.indices(grid_map.shape)
+
+    # Притягивающее поле (отрицательное)
+    att_field = np.zeros_like(grid_map, dtype=np.float32)
+
+    # Притяжение к цели
+    dx = x_coords - goal[0]
+    dy = y_coords - goal[1]
+    att_field = -0.5*k_att * np.exp(-scale_factor * np.sqrt(dx**2 + dy**2))  # Экспоненциальное затухание
+
+    att_points = np.zeros_like(grid_map, dtype=np.float32)
+    # Притяжение к промежуточным точкам пути
+    for pt in path_points:
+        dx_pt = x_coords - pt[0]
+        dy_pt = y_coords - pt[1]
+        att_points+= -0.5*k_att * np.exp(-scale_factor * np.sqrt(dx_pt**2 + dy_pt**2))  # Экспоненциальное затухание
+
+    # Отталкивающее поле (положительное)
+    rep_field = np.zeros_like(grid_map, dtype=np.float64)
+    obstacles = np.argwhere(grid_map == 1)
+
+    for (y, x) in obstacles:
+        dist_map = np.sqrt((x_coords - x)**2 + (y_coords - y)**2)
+        mask = (dist_map < d0) & (dist_map > 0)
+        rep_field[mask] += k_rep * (1.0 / dist_map[mask] - 1.0 / d0) ** 2
+
+    # Итоговое поле
+    field = att_field + att_points +rep_field
+
+    return field
 
 
 class TurtleBotEnv(Node, gym.Env):
@@ -23,6 +160,7 @@ class TurtleBotEnv(Node, gym.Env):
         
         self.bridge = CvBridge()
         self.camera_obstacle_detected = False
+        self.lidar_obstacle_detected = False
         
         self.target_x = -2.0
         self.target_y = -6.0
@@ -30,6 +168,15 @@ class TurtleBotEnv(Node, gym.Env):
         
         self.x_range = [-10,10]
         self.y_range = [-10,10]
+        self.state_pose = [-2.0, -0.5]
+
+        slam_map = cv2.imread('map.pgm', cv2.IMREAD_GRAYSCALE)
+        self.grid_map = slam_to_grid_map(slam_map)
+
+        self.optimal_path = path(self.state_pose, self.goal, self.grid_map)
+        self.potential_field = generate_potential_field(self.grid_map, world_to_map(self.goal, 0.05, (-4.86, -7.36), (45, 15), self.grid_map.shape), self.optimal_path)
+        self.show_potential_field()  
+        
 
         self.current_x = 0.0
         self.current_y = 0.0
@@ -47,6 +194,7 @@ class TurtleBotEnv(Node, gym.Env):
         
         self.timer = self.create_timer(0.1, self._timer_callback)
 
+
     def _timer_callback(self):
         pass 
 
@@ -62,12 +210,30 @@ class TurtleBotEnv(Node, gym.Env):
         # self.obstacles = [r if not math.isinf(r) and not math.isnan(r) and msg.range_min < r < msg.range_max else msg.range_max for r in msg.ranges]
     
     def scan_callback(self, msg):
-        self.obstacles = [r if not math.isinf(r) and not math.isnan(r) and msg.range_min < r < msg.range_max 
-                      else msg.range_max for r in msg.ranges]
+        raw_obstacles = [r if not math.isinf(r) and not math.isnan(r) and msg.range_min < r < msg.range_max 
+                        else msg.range_max for r in msg.ranges]
+        
+        self.obstacles = raw_obstacles
+        min_obstacle_dist = min(raw_obstacles) if raw_obstacles else float('inf')
+        
+        # Конвертация координат
+        current_x, current_y = world_to_map(
+            (self.current_x, self.current_y),
+            resolution=0.05,
+            origin=(-4.86, -7.36),
+            map_offset=(45, 15),
+            map_shape=self.grid_map.shape
+        )
 
-        if not self.obstacles:
-            self.obstacles = []  
-
+        # Получаем значение поля
+        potential_value = self.potential_field[current_y, current_x]
+        print(f"Potential: {potential_value:.2f}, Min dist: {min_obstacle_dist:.2f}")
+        
+        # Логика определения препятствий
+        self.lidar_obstacle_detected = (
+            (min_obstacle_dist < 0.3) and     # Лидар обнаружил близкое препятствие
+            (potential_value > 0)          # Высокий потенциал в опасной зоне
+        )
     def camera_callback(self, msg):
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
@@ -79,6 +245,17 @@ class TurtleBotEnv(Node, gym.Env):
         except Exception as e:
             self.get_logger().error(f"Error processing image: {e}")
             self.camera_obstacle_detected = False
+    
+    def show_potential_field(self):
+
+        goal_pixel = world_to_map(self.goal, resolution=0.05, origin=(-4.86, -7.36), map_offset=(45, 15),map_shape=self.grid_map.shape)
+        plt.figure(figsize=(10, 8))
+        plt.imshow(self.potential_field, cmap='jet')
+        plt.colorbar(label='Potential')
+        plt.scatter(goal_pixel[0], goal_pixel[1], c='green', s=200, marker='*', label='Goal')
+        plt.title("Potential Field Visualization")
+        plt.legend()
+        plt.show()
 
     def process_camera_image(self, cv_image):
    
@@ -101,6 +278,53 @@ class TurtleBotEnv(Node, gym.Env):
         # print(obstacle_detected)
         return obstacle_detected
     
+
+    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, k_att=5.0, k_rep=50.0, d0=1.5):
+        current_x, current_y, _, min_obstacle_dist = state
+
+        # Преобразуем координаты в пиксельные
+        current_x, current_y = world_to_map(
+            (current_x, current_y),
+            resolution=0.05,
+            origin=(-4.86, -7.36),
+            map_offset=(45, 15),
+            map_shape=self.grid_map.shape
+        )
+
+        goal_x, goal_y = world_to_map(goal, 0.05, (-4.86, -7.36), (45, 15), self.grid_map.shape)
+
+        # Притягивающий потенциал
+        dist_to_goal = np.linalg.norm([current_x - goal_x, current_y - goal_y])
+        R_goal = -0.5 * k_att * dist_to_goal
+
+        # Притягивающий потенциал от ближайшей промежуточной точки
+        if intermediate_points:
+            nearest_intermediate = min(intermediate_points, key=lambda p: np.linalg.norm([current_x - p[0], current_y - p[1]]))
+            dist_to_intermediate = np.linalg.norm([current_x - nearest_intermediate[0], current_y - nearest_intermediate[1]])
+            R_intermediate = -0.5 * k_att * dist_to_intermediate
+        else:
+            R_intermediate = 0
+
+        # Отталкивающий потенциал
+        potential_value = self.potential_field[current_y, current_x]
+        R_potential = -potential_value  # Чем выше потенциал, тем хуже награда
+
+        grad_y, grad_x = np.gradient(self.potential_field)  # Получаем градиент потенциального поля
+        grad_at_current = np.array([grad_x[current_y, current_x], grad_y[current_y, current_x]])  # Градиент в точке
+
+        # Награда на основе градиента
+        grad_reward = -np.linalg.norm(grad_at_current)  # Чем больше градиент, тем хуже награда
+
+        # Отталкивающий потенциал от препятствий
+        if obstacle_detected and min_obstacle_dist > 0:
+            R_repulsive = k_rep * (1 / min_obstacle_dist - 1 / d0) ** 2
+        else:
+            R_repulsive = 0
+
+        reward = R_goal + R_intermediate + R_repulsive + R_potential + grad_reward
+        # print(f'R_goal: {R_goal}, R_intermediate: {R_intermediate}, R_repulsive: {R_repulsive}')
+        return reward
+
     def step(self, action):
         cmd_msg = Twist()
         if action == 0:
@@ -121,16 +345,15 @@ class TurtleBotEnv(Node, gym.Env):
         angle_diff = (angle_to_goal - self.current_yaw + np.pi) % (2 * np.pi) - np.pi
 
         min_obstacle_dist = min(self.obstacles) if self.obstacles else float('inf')
-        obstacle_detected = (min_obstacle_dist < 0.5 and self.camera_obstacle_detected)
+
+        obstacle_detected = self.lidar_obstacle_detected or self.camera_obstacle_detected
         state = np.array([self.current_x, self.current_y, angle_diff, min_obstacle_dist])
 
-        distance_rate = (self.past_distance - distance)
+        # distance_rate = (self.past_distance - distance)
         # print(min_obstacle_dist)
-        reward = 500.0 * distance_rate
-        self.past_distance = distance
-        # if self.prev_distance is not None:
-        #     reward += 10 if distance < self.prev_distance else -10
-        # self.prev_distance = distance
+        reward = self.compute_potential_reward(state, self.goal, self.optimal_path, obstacle_detected)
+        # reward += 50.0 * distance_rate
+        # self.past_distance = distance
 
         done = False
         if obstacle_detected:
@@ -140,7 +363,7 @@ class TurtleBotEnv(Node, gym.Env):
             reward += 120 
             done = True
         elif self.steps >= self.max_steps:
-            reward -= 150
+            reward -= 100
             done = True
         else:
             done = False
@@ -172,7 +395,7 @@ class TurtleBotEnv(Node, gym.Env):
         self.current_yaw = 0.0
         self.steps = 0
         self.prev_distance = None
-        # self.obstacles = []
+        self.obstacles = []
         self.camera_obstacle_detected = False
         return np.array([self.current_x, self.current_y, 0.0, 0.0])  
  
