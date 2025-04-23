@@ -91,7 +91,7 @@ class ImprovedCritic(tf.keras.Model):
         self.dropout = layers.Dropout(rate=0.1)
         self.out = layers.Dense(1, activation=None, kernel_initializer='he_uniform')
 
-    def call(self, obs, training=True):
+    def call(self, obs, training=False):
         """
         :param obs: вектор состояния, например [x, y, ...]
         :param deviation_from_path: отклонение от оптимального пути (скаляр)

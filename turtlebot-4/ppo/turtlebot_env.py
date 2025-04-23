@@ -11,10 +11,13 @@ from std_srvs.srv import Empty
 from cv_bridge import CvBridge
 import cv2
 import collections
-from my_turtlebot_package.rrt_star import RRTStar
+from rrt_star import RRTStar
 import matplotlib.pyplot as plt
 from collections import deque
 import logging
+import time
+from gazebo_msgs.srv import SetEntityState
+from gazebo_msgs.msg import EntityState
 
 logging.basicConfig(filename='training_logs.txt', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -201,6 +204,9 @@ class TurtleBotEnv(Node, gym.Env):
         self.prev_x = None  # Предыдущая координата X
         self.prev_y = None  # Предыдущая координата Y
         self.obstacle_count = 0  
+        self.lam = 0.5
+        self.beta_spin = 0.15
+        self.reward_scale = 0.15
         
 
         self.current_x = 0.0
@@ -209,11 +215,11 @@ class TurtleBotEnv(Node, gym.Env):
         self.obstacles = []
         self.prev_distance = None
         self.past_distance = 0
-        self.max_steps = 5000
+        self.max_steps = 700
         self.steps = 0 
         self.recent_obstacles = []
         
-        self.action_space = spaces.Box(low=np.array([0.0, -2.84]), high=np.array([0.22, 2.84]), dtype=np.float32)
+        self.action_space = spaces.Box(low=np.array([0.0, -1.82]), high=np.array([0.26, 1.82]), dtype=np.float32)
         self.observation_space = spaces.Box(low=np.array([-10.0, -10.0, -np.pi, 0.0]), 
                                             high=np.array([10.0, 10.0, np.pi, 12.0]), 
                                             shape=(4,), dtype=np.float32)
@@ -352,8 +358,7 @@ class TurtleBotEnv(Node, gym.Env):
 
         potential_value = self.potential_field[current_y, current_x] 
         delta_potential = self.prev_potential - potential_value
-        R_potential = np.clip(-delta_potential, -1.0, 1.0)
-        self.prev_potential = potential_value
+        R_potential = np.clip(delta_potential, -1.0, 1.0)
 
         # === Притяжение к промежуточной точке ===
         R_intermediate = 0.0
@@ -366,17 +371,6 @@ class TurtleBotEnv(Node, gym.Env):
             curr_dist = np.linalg.norm([current_x - nearest_intermediate[0], current_y - nearest_intermediate[1]])
             R_intermediate = np.clip(k_att * (prev_dist - curr_dist), -1.0, 1.0)
 
-        # === Градиент к цели ===
-        motion_direction = np.array([np.cos(self.current_yaw), np.sin(self.current_yaw)])
-        direction_to_goal = np.array([goal_x - current_x, goal_y - current_y])
-        norm = np.linalg.norm(direction_to_goal)
-        direction_to_goal = direction_to_goal / norm if norm > 0 else np.array([1.0, 0.0])
-        projection = np.dot(motion_direction, direction_to_goal)
-        grad_reward = np.clip(lam * projection, -1.0, 1.0)
-
-        if self.lidar_obstacle_detected and projection < 0:
-            grad_reward -= 2.0
-
         # === Отталкивающее поле ===
         R_repulsive = 0.0
         if min_obstacle_dist < d0 and obstacle_detected:
@@ -388,22 +382,18 @@ class TurtleBotEnv(Node, gym.Env):
         if self.lidar_obstacle_detected and (potential_value - self.prev_potential > 0.2 or potential_value == self.prev_potential):
             R_fake_path = -5.0
 
-        if self.steps % 5 != 0:
-            R_repulsive = 0
-            R_fake_path = 0
         # === Суммарная награда ===
         total_reward = (
             1.0 * R_potential +
             1.0 * R_intermediate +
-            1.0 * grad_reward +
             1.0 * R_repulsive +
             1.0 * R_fake_path
         )
-        total_reward = np.clip(total_reward, -10.0, 10.0)
+        # total_reward = np.clip(total_reward, -10.0, 10.0)
 
         # === Логгирование ===
-        logger.info(f"R_potential: {R_potential:.2f}, R_intermediate: {R_intermediate:.2f}, grad: {grad_reward:.2f}, rep: {R_repulsive:.2f}, fake: {R_fake_path:.2f}, total: {total_reward:.2f}")
-
+        logger.info(f"R_potential: {R_potential:.2f}, R_intermediate: {R_intermediate:.2f}, rep: {R_repulsive:.2f}, fake: {R_fake_path:.2f}, total: {total_reward:.2f}")
+        self.prev_potential = potential_value
         self.prev_x, self.prev_y = current_x, current_y
         return total_reward
 
@@ -441,13 +431,16 @@ class TurtleBotEnv(Node, gym.Env):
 
     def step(self, action):
         cmd_msg = Twist()
-        linear = float(np.clip(action[0], 0.0, 0.22))
-        angular = float(np.clip(action[1], -2.84, 2.84))
+        linear = float(np.clip(action[0], 0.0, 0.26))
+        angular = float(np.clip(action[1], -1.82, 1.82))
 
-        cmd_msg.linear.x = linear
+        cmd_msg.linear.x  = linear
         cmd_msg.angular.z = angular
-        rclpy.spin_once(self, timeout_sec=0.1) 
+
+        prev_xw, prev_yw = self.current_x, self.current_y
         self.publisher_.publish(cmd_msg)
+        rclpy.spin_once(self, timeout_sec=0.2)
+        time.sleep(0.1)   
     
         self.steps += 1
         
@@ -461,21 +454,32 @@ class TurtleBotEnv(Node, gym.Env):
         obstacle_detected = self.lidar_obstacle_detected or self.camera_obstacle_detected
         state = np.array([self.current_x, self.current_y, angle_diff, min_obstacle_dist])
 
+        dx, dy = self.current_x - prev_xw, self.current_y - prev_yw
+        disp = np.array([dx, dy])
+        to_goal = np.array([self.target_x - prev_xw, self.target_y - prev_yw])
+        norm = np.linalg.norm(to_goal)
+        to_goal /= norm if norm>0 else 1.0
+        # grad_reward = np.clip(self.lam * np.dot(disp, to_goal), -1.0, 1.0)
+                     # вес 5.0 — подберите по эфиру
         # distance_rate = (self.past_distance - distance)
         # print(min_obstacle_dist)
         reward_potent_val = self.compute_potential_reward(state, self.goal, self.optimal_path, obstacle_detected)
         reward_optimal_path = self.get_deviation_penalty(state[:2])
 
-        # Награда за приближение к цели
-        reward_goal_progress = 0.0
-        if self.prev_distance is not None:
-            delta = self.prev_distance - distance
-            reward_goal_progress = np.clip(delta * 100.0, -10.0, 10.0)  # усиленный сигнал
-        self.prev_distance = distance
+        # if abs(angular) > 0.9:
+        #     spin_penalty = - self.beta_spin * abs(angular)
+        # else:
+        #     spin_penalty = 0
+
+        dx = self.current_x - prev_xw
+        dy = self.current_y - prev_yw
+        disp = np.array([dx, dy])
+        dist_forward = np.dot(disp, to_goal)              # скалярная проекция смещения
+        forward_reward = 5.0 * dist_forward  
+        # reward += forward_reward
 
         # Общая награда
-        reward = reward_potent_val + reward_goal_progress + reward_optimal_path
-
+        reward = reward_potent_val + reward_optimal_path + forward_reward
         # ====== Терминальные случаи ======
         done = False
 
@@ -483,7 +487,7 @@ class TurtleBotEnv(Node, gym.Env):
         if obstacle_detected:
             self.obstacle_count += 1
             reward -= 5  # менее жёстко
-            if self.obstacle_count >= 100:
+            if self.obstacle_count >= 500:
                 done = True
                 self.obstacle_count = 0
                 print("Episode terminated due to repeated obstacle detection")
@@ -505,9 +509,9 @@ class TurtleBotEnv(Node, gym.Env):
             print("Episode terminated due to step limit")
 
         # 5. Безопасное ограничение награды
-        reward = np.clip(reward, -20.0, 30.0)
+        tot_reward = np.clip(reward * self.reward_scale, -1.0, 1.0)
 
-        return state, reward, done, {}
+        return state, tot_reward, done, {}
 
 
     def reset(self):
@@ -551,7 +555,6 @@ class TurtleBotEnv(Node, gym.Env):
         # === 5. Возвращаем корректное состояние ===
         min_obstacle_dist = 3.5 if not self.obstacles else min(self.obstacles)
         return np.array([self.current_x, self.current_y, self.current_yaw, min_obstacle_dist])
-
  
     def render(self, mode='human'):
         pass

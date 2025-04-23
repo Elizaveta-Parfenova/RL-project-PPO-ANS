@@ -2,6 +2,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 from tensorflow import keras
 from tensorflow.keras import layers
+from tensorflow.keras import initializers
 import numpy as np
 
 class ResBlock(tf.keras.Model):
@@ -44,13 +45,18 @@ class ImprovedActor(tf.keras.Model):
         self.rb1 = ResBlock(state_dim, state_dim, n_neurons)
         self.rb2 = ResBlock(state_dim + state_dim, state_dim + state_dim, n_neurons)
 
-        self.action_low = tf.constant([0.0, -2.84], dtype=tf.float32)
-        self.action_high = tf.constant([0.22, 2.84], dtype=tf.float32)
+        self.action_low  = tf.constant([0.0, -1.82], dtype=tf.float32)
+        self.action_high = tf.constant([0.26,  1.82], dtype=tf.float32)
         self.dropout = layers.Dropout(rate=0.1)
         self.mu_layer = layers.Dense(action_dim, activation='tanh')  # Ограничим действия в диапазоне [-1, 1]
-        self.log_std_layer = layers.Dense(action_dim, activation='softplus')  # std всегда > 0
+        self.log_std_layer = layers.Dense(
+            action_dim,
+            activation='softplus',
+            kernel_initializer='he_uniform',
+            bias_initializer=initializers.Constant(-3.0)
+        )
 
-    def call(self, obs, training=True):
+    def call(self, obs, training=False):
         if isinstance(obs, np.ndarray):
             obs = tf.convert_to_tensor(obs, dtype=tf.float32)
 
@@ -69,12 +75,21 @@ class ImprovedActor(tf.keras.Model):
         log_std = self.log_std_layer(x)
         std = tf.exp(log_std)
 
-        dist = tfp.distributions.Normal(loc=mu, scale=std)
-        sampled = tf.clip_by_value(dist.sample(), -1.0, 1.0)
-        action_scaled = self.action_low + (sampled + 1.0) * 0.5 * (self.action_high - self.action_low)
+        base_dist = tfp.distributions.Normal(loc=mu, scale=std)
+        dist = tfp.distributions.TransformedDistribution(
+            distribution=base_dist,
+            bijector=tfp.bijectors.Tanh()
+        )
 
-        log_prob = tf.reduce_sum(dist.log_prob(sampled), axis=-1)
-        entropy = tf.reduce_sum(dist.entropy(), axis=-1)
+        # 1) Сэмплируем действие в [-1,1] уже внутри bi-вектора
+        raw_action = dist.sample()
+        # 2) Маппим в ваш диапазон [action_low, action_high]
+        action_scaled = self.action_low + (raw_action + 1.0) * 0.5 * (self.action_high - self.action_low)
+
+        # 3) Лог‑правдоподобие и энтропия считаем уже в «реальном» пространстве
+        log_prob = tf.reduce_sum(dist.log_prob(raw_action), axis=-1)
+        entropy  = tf.reduce_sum(base_dist.entropy(), axis=-1)
+
 
         return action_scaled, log_prob, entropy, mu_scaled, std
 
