@@ -78,6 +78,15 @@ def world_to_map(world_coords, resolution, origin, map_offset, map_shape):
     return x_map, y_map
 
 
+def map_to_world(pixel, resolution, origin, map_offset, map_shape):
+    x_px, y_px = pixel
+    # сначала undo offset+flip:
+    y_map = map_shape[0] - y_px - 1
+    x_map = x_px
+    x_w = origin[0] + (x_map - map_offset[0]) * resolution
+    y_w = origin[1] + (y_map - map_offset[1]) * resolution
+    return (x_w, y_w)
+
 def path(state, goal, grid_map, map_resolution = 0.05, map_origin = (-4.86, -7.36)):
     
     state_world = state # Текущая позиция в мировых координатах
@@ -138,8 +147,8 @@ def compute_deviation_from_path(current_pos, optimal_path):
     min_distance = np.min(distances)
     return min_distance
 
-def generate_potential_field(grid_map, goal, path_points, 
-                             k_att=5.0, k_rep=10.0, d0=3.0, scale = 0.05, normalize = False):
+def generate_potential_field(grid_map, goal, path_points, resolution = 0.05, 
+                             k_att=4.0, k_rep=10.0, d0=3.5, scale = 0.07, normalize = False):
     """
     Генерация потенциального поля:
       - Квадратичное притяжение к цели и оптимальному пути.
@@ -151,34 +160,36 @@ def generate_potential_field(grid_map, goal, path_points,
     obstacle_mask = (grid_map == 1)
     # 2) оптимальный путь: построим булевую карту
     path_mask = np.zeros_like(grid_map, dtype=bool)
-    for x, y in path_points:
-        path_mask[y, x] = True
+    for pt in path_points:
+        x_pix, y_pix = world_to_map(pt, resolution=0.05, origin=(-4.86, -7.36), map_offset=(45, 15), map_shape=grid_map.shape)
+        path_mask[y_pix, x_pix] = True
+    goal_mask = np.zeros_like(grid_map, dtype=bool) 
+    gx, gy = world_to_map(goal, resolution=0.05, origin=(-4.86, -7.36), map_offset=(45, 15), map_shape=grid_map.shape)
+    goal_mask[gy, gx] = True
 
     # 1) расстояние до препятствий
-    dist_obs = distance_transform_edt(~obstacle_mask)
+    dist_obs = distance_transform_edt(~obstacle_mask) 
     # 2) расстояние до пути
-    dist_path = distance_transform_edt(~path_mask)
+    dist_path = distance_transform_edt(~path_mask) 
     # 3) расстояние до цели: сделаем одну точку
-    goal_mask = np.zeros_like(grid_map, dtype=bool)
-    gx, gy = goal
-    goal_mask[gy, gx] = True
-    dist_goal = distance_transform_edt(~goal_mask)
+    dist_goal = distance_transform_edt(~goal_mask) 
 
     # ---------- поля ----------
     # квадратичное притяжение к цели (отрицательное)
-    att_goal = -0.5 * k_att * np.exp(-scale * dist_goal)
+    att_goal = - 0.5 * k_att * np.exp(-scale * dist_goal) 
+    
     # квадратичное притяжение к пути
-    att_path = -0.5 * k_att * np.exp(-scale * dist_path)
+    att_path = - 0.5 * k_att * np.exp(-scale * dist_path) 
 
     # отталкивающее поле (квадратичное), только внутри d0
-    rep_field = np.zeros_like(grid_map, dtype=np.float32)
+    rep_field = np.zeros_like(grid_map, dtype=np.float32) 
     # для каждой клетки, где dist_obs <= d0: 
     mask = (dist_obs <= d0) & (dist_obs > 0)
     inv = 1.0 / (dist_obs[mask] + 1e-5)
     rep_field[mask] = 0.5 * k_rep * (inv - 1.0/d0)**2
 
     # объединяем
-    field = att_goal + att_path + rep_field
+    field = rep_field + att_goal + att_path
 
     # по желанию нормализуем на [-1,1] или 0..1
     if normalize:
@@ -211,8 +222,12 @@ class TurtleBotEnv(Node, gym.Env):
         self.grid_map = slam_to_grid_map(slam_map)
         self.camera_history = deque(maxlen=20)  
 
-        self.optimal_path = path(self.state_pose, self.goal, self.grid_map)
-        self.potential_field = generate_potential_field(self.grid_map, world_to_map(self.goal, 0.05, (-4.86, -7.36), (45, 15), self.grid_map.shape), self.optimal_path)
+        optimal_path_px = path(self.state_pose, self.goal, self.grid_map)
+        optimal_path_w = [map_to_world(p, 0.05, (-4.86, -7.36), (45,15), self.grid_map.shape) for p in optimal_path_px]
+        self.optimal_path = optimal_path_w
+        print(self.optimal_path)
+
+        self.potential_field = generate_potential_field(self.grid_map, self.goal, self.optimal_path)
         self.show_potential_field() 
         self.prev_potential = 0 
         self.prev_x = None  # Предыдущая координата X
@@ -332,7 +347,7 @@ class TurtleBotEnv(Node, gym.Env):
             map_shape=self.grid_map.shape
         )
         plt.figure(figsize=(10, 8))
-        plt.imshow(self.potential_field, cmap='jet')  # ← origin='lower'!
+        plt.imshow(self.potential_field, cmap='jet') 
         plt.colorbar(label='Potential')
         plt.scatter(
             goal_pixel[0],
@@ -368,11 +383,11 @@ class TurtleBotEnv(Node, gym.Env):
         return obstacle_detected
     
    
-    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, k_att=5.0, k_rep=10.0, d0=3.0, lam=0.5):
+    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, resolution = 0.05, k_att=5.0, k_rep=10.0, d0=3.0, lam=0.5):
         current_x, current_y, _, min_obstacle_dist = state
 
         # Преобразуем координаты в пиксельные
-        current_x, current_y = world_to_map(
+        current_x_, current_y_ = world_to_map(
             (current_x, current_y),
             resolution=0.05,
             origin=(-4.86, -7.36),
@@ -380,11 +395,11 @@ class TurtleBotEnv(Node, gym.Env):
             map_shape=self.grid_map.shape
         )
 
-        goal_x, goal_y = world_to_map(goal, 0.05, (-4.86, -7.36), (45, 15), self.grid_map.shape)
+        # goal_x, goal_y = world_to_map(goal, 0.05, (-4.86, -7.36), (45, 15), self.grid_map.shape)
 
-        potential_value = self.potential_field[current_y, current_x] 
+        potential_value = self.potential_field[current_y_, current_x_] 
         delta_potential = self.prev_potential - potential_value
-        R_potential = np.clip(delta_potential, -1.0, 1.0)
+        R_potential = delta_potential * resolution
 
         # === Притяжение к промежуточной точке ===
         R_intermediate = 0.0
@@ -395,63 +410,43 @@ class TurtleBotEnv(Node, gym.Env):
             nearest_intermediate = min(intermediate_points, key=lambda p: np.linalg.norm([current_x - p[0], current_y - p[1]]))
             prev_dist = np.linalg.norm([self.prev_x - nearest_intermediate[0], self.prev_y - nearest_intermediate[1]])
             curr_dist = np.linalg.norm([current_x - nearest_intermediate[0], current_y - nearest_intermediate[1]])
-            R_intermediate = np.clip(k_att * (prev_dist - curr_dist), -1.0, 1.0)
+            R_intermediate = k_att * (prev_dist - curr_dist)
 
         # === Отталкивающее поле ===
         R_repulsive = 0.0
         if min_obstacle_dist < d0 and obstacle_detected:
             R_repulsive = -k_rep * (1 / min_obstacle_dist - 1 / d0) ** 2
-            R_repulsive = np.clip(R_repulsive, -10.0, 0.0)
 
-        # === Штраф за ложный путь ===
-        R_fake_path = 0.0
-        if self.lidar_obstacle_detected and (potential_value - self.prev_potential > 0.2 or potential_value == self.prev_potential):
-            R_fake_path = -5.0
+        # # === Штраф за ложный путь ===
+        # R_fake_path = 0.0
+        # if self.lidar_obstacle_detected and (potential_value - self.prev_potential > 0.2 or potential_value == self.prev_potential):
+        #     R_fake_path = -5.0
 
         # === Суммарная награда ===
         total_reward = (
             1.0 * R_potential +
-            0.5 * R_intermediate +
-            1.0 * R_repulsive +
-            1.0 * R_fake_path
+            1.0 * R_intermediate +
+            1.0 * R_repulsive 
         )
         # total_reward = np.clip(total_reward, -10.0, 10.0)
 
         # === Логгирование ===
-        logger.info(f"R_potential: {R_potential:.2f}, R_intermediate: {R_intermediate:.2f}, rep: {R_repulsive:.2f}, fake: {R_fake_path:.2f}, total: {total_reward:.2f}")
+        logger.info(f"R_potential: {R_potential:.2f}, R_intermediate: {R_intermediate:.2f}, rep: {R_repulsive:.2f}, total: {total_reward:.2f}")
         self.prev_potential = potential_value
         self.prev_x, self.prev_y = current_x, current_y
         return total_reward
 
     
     def compute_deviation_from_path(self, current_pos):
-        """
-        Вычисляет минимальное расстояние от текущей позиции агента до оптимального пути.
-        :param current_pos: (x, y) текущая позиция агента.
-        :param optimal_path: список точек пути [(x1, y1), (x2, y2), ...]
-        :return: минимальное расстояние до пути (скаляр).
-        """
+        
         path_points = np.array(self.optimal_path)
-        distances = np.linalg.norm(path_points - np.array(current_pos), axis=1)
-        min_distance = np.min(distances)
+        distances = np.linalg.norm(path_points - current_pos, axis=1)
+        min_distance = float(distances.min())
         return min_distance
 
     def get_deviation_penalty(self, current_pos, max_penalty=1):
-        """
-        Рассчитывает штраф за отклонение от пути.
-        :param current_pos: (x, y) текущая позиция агента.
-        :param optimal_path: список точек пути [(x1, y1), (x2, y2), ...].
-        :param max_penalty: максимальный штраф за сильное отклонение.
-        :return: штраф (скаляр, отрицательный).
-        """
-        if current_pos.ndim == 2 and current_pos.shape[0] == 1:
-            current_pos = current_pos[0]
-
-        state = world_to_map(current_pos, resolution = 0.05, origin = (-4.86, -7.36),  map_offset = (45, 15), map_shape = self.grid_map.shape)
-        
-        deviation = self.compute_deviation_from_path(state)
-        
-        # Можно сделать штраф линейным или экспоненциальным в зависимости от задачи
+  
+        deviation = self.compute_deviation_from_path(current_pos)
         penalty = -min(max_penalty, deviation)  # Чем дальше от пути, тем больше штраф
         return penalty
 
@@ -501,12 +496,15 @@ class TurtleBotEnv(Node, gym.Env):
         dy = self.current_y - prev_yw
         disp = np.array([dx, dy])
         dist_forward = np.dot(disp, to_goal)              # скалярная проекция смещения
-        forward_reward = np.clip(2.0 * dist_forward, -1.0, +1.0)
+        forward_reward = 3.0 * dist_forward
         # reward += forward_reward
 
-        spin_penalty = - self.beta_spin * abs(angular)
+        # spin_penalty = - self.beta_spin * abs(angular)
         # Общая награда
-        reward = reward_potent_val + reward_optimal_path + forward_reward + spin_penalty
+        reward = reward_potent_val + reward_optimal_path + forward_reward - 0.02
+        logger.info(f"Reward_potent_val: {reward_potent_val:.2f}")
+        logger.info(f"Reward_optimal_path: {reward_optimal_path:.2f}")
+        logger.info(f"Forward_reward: {forward_reward:.2f}")
         # ====== Терминальные случаи ======
         done = False
 
@@ -536,9 +534,9 @@ class TurtleBotEnv(Node, gym.Env):
             print("Episode terminated due to step limit")
 
         # 5. Безопасное ограничение награды
-        tot_reward = np.clip(reward * self.reward_scale, -10.0, 10.0)
-
-        return state, tot_reward, done, {}
+        # tot_reward = np.clip(reward * self.reward_scale, -10.0, 10.0)
+        logger.info(f"Total_reward: {reward:.2f}")
+        return state, reward, done, {}
 
 
     def reset(self):

@@ -88,20 +88,20 @@ class PPOAgent:
         # print(self.obstacles)
 
         # Коэффициенты
-        self.gamma = 0.995  # коэффициент дисконтирования
+        self.gamma = 0.99  # коэффициент дисконтирования
         self.epsilon = 0.15 # параметр клиппинга
         self.actor_lr = 0.0003
         self.critic_lr = 0.0003
         self.gaelam = 0.95
-        self.min_entropy = 0.005
-        self.max_entropy = 0.1
+        self.min_entropy = 0
+        self.max_entropy = 0.05
         # self.alpha = 0.1
 
         # Модели
         self.actor = ImprovedActor(self.state_dim, self.action_dim)
         self.critic = ImprovedCritic(self.state_dim, grid_map=self.grid_map, optimal_path=self.optimal_path)
-        self.value_map = precompute_value_map(self.grid_map, self.optimal_path, self.goal)
-        self.critic_st = StaticCritic(self.value_map, self.grid_map) 
+        # self.value_map = precompute_value_map(self.grid_map, self.optimal_path, self.goal)
+        # self.critic_st = StaticCritic(self.value_map, self.grid_map) 
 
         # self.value_map = self.critic.initialize_value_map(grid_map=self.grid_map)  
         
@@ -111,7 +111,7 @@ class PPOAgent:
 
         # print(self.value_map)
 
-        plot_value_map(self.value_map)
+        # plot_value_map(self.value_map)
 
         # Оптимизаторы
         self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate=self.actor_lr)
@@ -230,11 +230,11 @@ class PPOAgent:
                 
                 next_state = np.reshape(next_state, [1, self.state_dim])
 
-                value_learned = self.critic.call(state)[0, 0]
-                value_static = self.critic_st.call(state)  # StaticCritic
+                value_learned = float(self.critic.call(state)[0, 0].numpy())
+                # value_static = self.critic_st.call(state)  # StaticCritic
                 
                 logger.info(f'Value learned:  {value_learned}')
-                logger.info(f'Value static:  {value_static}')
+                # logger.info(f'Value static:  {value_static}')
 
                 states.append(state)
                 actions.append(action)
@@ -242,7 +242,7 @@ class PPOAgent:
                 dones.append(done)
                 probs.append(log_prob)
                 values_learned.append(value_learned)
-                values_static.append(value_static)
+                # values_static.append(value_static)
 
                 state = next_state
                 episode_reward += reward
@@ -253,11 +253,11 @@ class PPOAgent:
             #     continue
 
             # Последнее значение критика
-            next_value_learned = self.critic.call(next_state)[0, 0]
-            next_value_static = self.critic_st.call(next_state)
+            next_value_learned = float(self.critic.call(next_state)[0, 0].numpy())
+            # next_value_static = self.critic_st.call(next_state)
 
             values_learned.append(next_value_learned)
-            values_static.append(next_value_static)
+            # values_static.append(next_value_static)
 
             # Комбинируем значения критиков
             # values_combined = self.alpha * np.array(values_learned) + (1 - self.alpha) * np.array(values_static)
