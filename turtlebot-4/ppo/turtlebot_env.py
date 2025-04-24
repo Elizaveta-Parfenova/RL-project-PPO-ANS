@@ -18,6 +18,7 @@ import logging
 import time
 from gazebo_msgs.srv import SetEntityState
 from gazebo_msgs.msg import EntityState
+from scipy.ndimage import distance_transform_edt
 
 logging.basicConfig(filename='training_logs.txt', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -137,42 +138,53 @@ def compute_deviation_from_path(current_pos, optimal_path):
     min_distance = np.min(distances)
     return min_distance
 
-def generate_potential_field(grid_map, goal, path_points, k_att=5.0, k_rep=10.0, d0=3.0, scale = 0.07):
+def generate_potential_field(grid_map, goal, path_points, 
+                             k_att=5.0, k_rep=10.0, d0=3.0, scale = 0.05, normalize = False):
     """
     Генерация потенциального поля:
-    - Квадратичное притяжение к цели и промежуточным точкам.
-    - Квадратичное отталкивание от препятствий в радиусе d0.
+      - Квадратичное притяжение к цели и оптимальному пути.
+      - Квадратичное отталкивание от препятствий в радиусе d0.
     """
-    height, width = grid_map.shape
-    y_coords, x_coords = np.indices(grid_map.shape)
-    obstacles = np.argwhere(grid_map == 1)
+    h, w = grid_map.shape
+    # подготовим маски
+    # 1) препятствия
+    obstacle_mask = (grid_map == 1)
+    # 2) оптимальный путь: построим булевую карту
+    path_mask = np.zeros_like(grid_map, dtype=bool)
+    for x, y in path_points:
+        path_mask[y, x] = True
 
-    # Притягивающее поле к цели
-    dx_goal = x_coords - goal[0]
-    dy_goal = y_coords - goal[1]
-    distance_to_goal = np.sqrt(dx_goal**2 + dy_goal**2)
-    # att_field = -0.5 * k_att * np.exp(-scale * distance_to_goal)
-    att_field = -0.5 * k_att * (distance_to_goal ** 2)
+    # 1) расстояние до препятствий
+    dist_obs = distance_transform_edt(~obstacle_mask)
+    # 2) расстояние до пути
+    dist_path = distance_transform_edt(~path_mask)
+    # 3) расстояние до цели: сделаем одну точку
+    goal_mask = np.zeros_like(grid_map, dtype=bool)
+    gx, gy = goal
+    goal_mask[gy, gx] = True
+    dist_goal = distance_transform_edt(~goal_mask)
 
-    # Притяжение к промежуточным точкам пути
-    att_points = np.zeros_like(grid_map, dtype=np.float32)
-    for pt in path_points:
-        dx_pt = x_coords - pt[0]
-        dy_pt = y_coords - pt[1]
-        distance_to_pt = np.sqrt(dx_pt**2 + dy_pt**2)
-        # att_points += -0.5 * k_att * np.exp(-scale * distance_to_pt)
-        att_points += -0.5 * k_att * (distance_to_pt ** 2)
+    # ---------- поля ----------
+    # квадратичное притяжение к цели (отрицательное)
+    att_goal = -0.5 * k_att * np.exp(-scale * dist_goal)
+    # квадратичное притяжение к пути
+    att_path = -0.5 * k_att * np.exp(-scale * dist_path)
 
-    # Отталкивающее поле от препятствий
+    # отталкивающее поле (квадратичное), только внутри d0
     rep_field = np.zeros_like(grid_map, dtype=np.float32)
-    for (y, x) in obstacles:
-        dist_map = np.sqrt((x_coords - x)**2 + (y_coords - y)**2)
-        mask = (dist_map <= d0) & (dist_map > 0)
-        inv_dist = 1 / (dist_map[mask] + 1e-5)
-        rep_field[mask] += 0.5 * k_rep * (inv_dist - 1/d0)**2
+    # для каждой клетки, где dist_obs <= d0: 
+    mask = (dist_obs <= d0) & (dist_obs > 0)
+    inv = 1.0 / (dist_obs[mask] + 1e-5)
+    rep_field[mask] = 0.5 * k_rep * (inv - 1.0/d0)**2
 
-    # Итоговое поле (притяжение - отталкивание)
-    field = att_field + att_points + rep_field
+    # объединяем
+    field = att_goal + att_path + rep_field
+
+    # по желанию нормализуем на [-1,1] или 0..1
+    if normalize:
+        mn, mx = field.min(), field.max()
+        field = 2*(field - mn)/(mx - mn) - 1  # теперь в [-1..1]
+
     return field
 
 class TurtleBotEnv(Node, gym.Env):
@@ -312,12 +324,24 @@ class TurtleBotEnv(Node, gym.Env):
             self.camera_history.append(False)
     
     def show_potential_field(self):
-
-        goal_pixel = world_to_map(self.goal, resolution=0.05, origin=(-4.86, -7.36), map_offset=(45, 15),map_shape=self.grid_map.shape)
+        goal_pixel = world_to_map(
+            self.goal,
+            resolution=0.05,
+            origin=(-4.86, -7.36),
+            map_offset=(45, 15),
+            map_shape=self.grid_map.shape
+        )
         plt.figure(figsize=(10, 8))
-        plt.imshow(self.potential_field, cmap='jet')
+        plt.imshow(self.potential_field, cmap='jet')  # ← origin='lower'!
         plt.colorbar(label='Potential')
-        plt.scatter(goal_pixel[0], goal_pixel[1], c='green', s=200, marker='*', label='Goal')
+        plt.scatter(
+            goal_pixel[0],
+            goal_pixel[1],
+            c='green',
+            s=200,
+            marker='*',
+            label='Goal'
+        )
         plt.title("Potential Field Visualization")
         plt.legend()
         plt.show()
@@ -387,7 +411,7 @@ class TurtleBotEnv(Node, gym.Env):
         # === Суммарная награда ===
         total_reward = (
             1.0 * R_potential +
-            1.0 * R_intermediate +
+            0.5 * R_intermediate +
             1.0 * R_repulsive +
             1.0 * R_fake_path
         )
@@ -477,11 +501,12 @@ class TurtleBotEnv(Node, gym.Env):
         dy = self.current_y - prev_yw
         disp = np.array([dx, dy])
         dist_forward = np.dot(disp, to_goal)              # скалярная проекция смещения
-        forward_reward = 5.0 * dist_forward  
+        forward_reward = np.clip(2.0 * dist_forward, -1.0, +1.0)
         # reward += forward_reward
 
+        spin_penalty = - self.beta_spin * abs(angular)
         # Общая награда
-        reward = reward_potent_val + reward_optimal_path + forward_reward
+        reward = reward_potent_val + reward_optimal_path + forward_reward + spin_penalty
         # ====== Терминальные случаи ======
         done = False
 
@@ -489,7 +514,7 @@ class TurtleBotEnv(Node, gym.Env):
         if obstacle_detected:
             self.obstacle_count += 1
             reward -= 5  # менее жёстко
-            if self.obstacle_count >= 500:
+            if self.obstacle_count >= 300:
                 done = True
                 self.obstacle_count = 0
                 print("Episode terminated due to repeated obstacle detection")
@@ -511,7 +536,7 @@ class TurtleBotEnv(Node, gym.Env):
             print("Episode terminated due to step limit")
 
         # 5. Безопасное ограничение награды
-        tot_reward = np.clip(reward * self.reward_scale, -1.0, 1.0)
+        tot_reward = np.clip(reward * self.reward_scale, -10.0, 10.0)
 
         return state, tot_reward, done, {}
 
@@ -554,9 +579,12 @@ class TurtleBotEnv(Node, gym.Env):
         self.prev_y = None
         self.obstacle_count = 0
 
+        angle_to_goal = math.atan2(self.target_y - self.current_y, self.target_x - self.current_x)
+        angle_diff = (angle_to_goal - self.current_yaw + np.pi) % (2 * np.pi) - np.pi
+
         # === 5. Возвращаем корректное состояние ===
         min_obstacle_dist = 3.5 if not self.obstacles else min(self.obstacles)
-        return np.array([self.current_x, self.current_y, self.current_yaw, min_obstacle_dist])
+        return np.array([self.current_x, self.current_y, angle_diff, min_obstacle_dist])
  
     def render(self, mode='human'):
         pass
