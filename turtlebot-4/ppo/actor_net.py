@@ -53,7 +53,7 @@ class ImprovedActor(tf.keras.Model):
             action_dim,
             activation='softplus',
             kernel_initializer='he_uniform',
-            bias_initializer=initializers.Constant(-3.0)
+            bias_initializer=initializers.Constant(-1.0)
         )
 
     def call(self, obs, training=False, raw_actions = None):
@@ -73,6 +73,7 @@ class ImprovedActor(tf.keras.Model):
 
         log_std = self.log_std_layer(x)
         std = tf.exp(log_std)
+        std = tf.clip_by_value(std, 1e-6, 1.5) 
 
         base_dist = tfp.distributions.Normal(loc=mu, scale=std)
         dist = tfp.distributions.TransformedDistribution(
@@ -81,25 +82,22 @@ class ImprovedActor(tf.keras.Model):
         )
         if raw_actions is None:
 
-            # 1) Сэмплируем действие в [-1,1] уже внутри bi-вектора
-            raw_action = dist.sample()
-            # 2) Маппим в ваш диапазон [action_low, action_high]
-            action_scaled = self.action_low + (raw_action + 1.0) * 0.5 * (self.action_high - self.action_low)
 
-            # 3) Лог‑правдоподобие и энтропия считаем уже в «реальном» пространстве
+            raw_action = dist.sample()
             log_prob = tf.reduce_sum(dist.log_prob(raw_action), axis=-1)
+
+            raw_action_clipped = tf.clip_by_value(raw_action, -0.999, 0.999)
+            action_scaled = self.action_low + (raw_action_clipped + 1.0) * 0.5 * (self.action_high - self.action_low)
+           
             entropy  = tf.reduce_sum(base_dist.entropy(), axis=-1)
 
-            return action_scaled, log_prob, entropy, std
+            return action_scaled, log_prob, entropy, std, raw_action
         else:
 
             log_prob = tf.reduce_sum(dist.log_prob(raw_actions), axis=-1)
             entropy  = tf.reduce_sum(base_dist.entropy(), axis=-1)
 
             return log_prob, entropy
-
-
-
     
     def get_config(self):
         config = super().get_config()

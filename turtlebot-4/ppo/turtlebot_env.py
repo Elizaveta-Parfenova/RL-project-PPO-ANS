@@ -148,7 +148,7 @@ def compute_deviation_from_path(current_pos, optimal_path):
     return min_distance
 
 def generate_potential_field(grid_map, goal, path_points, resolution = 0.05, 
-                             k_att=4.0, k_rep=10.0, d0=3.5, scale = 0.07, normalize = False):
+                             k_att=4.0, k_rep=10.0, d0=3.5, scale = 0.05, normalize = False):
     """
     Генерация потенциального поля:
       - Квадратичное притяжение к цели и оптимальному пути.
@@ -234,9 +234,9 @@ class TurtleBotEnv(Node, gym.Env):
         self.prev_y = None  # Предыдущая координата Y
         self.obstacle_count = 0  
         self.lam = 0.5
-        self.beta_spin = 0.15
+        self.beta_spin = 0.05
         self.reward_scale = 0.15
-        
+        self.odom_updated = False 
 
         self.current_x = 0.0
         self.current_y = 0.0
@@ -244,9 +244,11 @@ class TurtleBotEnv(Node, gym.Env):
         self.obstacles = []
         self.prev_distance = None
         self.past_distance = 0
-        self.max_steps = 500
+        self.max_steps = 1000
         self.steps = 0 
         self.recent_obstacles = []
+        self.wp_index = 0
+        self.wp_threshold = 0.3
         
         self.action_space = spaces.Box(low=np.array([0.0, -1.82]), high=np.array([0.26, 1.82]), dtype=np.float32)
         self.observation_space = spaces.Box(low=np.array([-10.0, -10.0, -np.pi, 0.0]), 
@@ -266,6 +268,8 @@ class TurtleBotEnv(Node, gym.Env):
         siny_cosp = 2.0 * (orientation_q.w * orientation_q.z + orientation_q.x * orientation_q.y)
         cosy_cosp = 1.0 - 2.0 * (orientation_q.y * orientation_q.y + orientation_q.z * orientation_q.z)
         self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        self.odom_updated = True
 
     # def scan_callback(self, msg):
         # self.obstacles = [r if not math.isinf(r) and not math.isnan(r) and msg.range_min < r < msg.range_max else msg.range_max for r in msg.ranges]
@@ -431,6 +435,7 @@ class TurtleBotEnv(Node, gym.Env):
         )
         # total_reward = np.clip(total_reward, -10.0, 10.0)
 
+
         # === Логгирование ===
         logger.info(f"R_potential: {R_potential:.2f}, R_intermediate: {R_intermediate:.2f}, rep: {R_repulsive:.2f}, total: {total_reward:.2f}")
         self.prev_potential = potential_value
@@ -445,7 +450,7 @@ class TurtleBotEnv(Node, gym.Env):
         min_distance = float(distances.min())
         return min_distance
 
-    def get_deviation_penalty(self, current_pos, max_penalty=1):
+    def get_deviation_penalty(self, current_pos, max_penalty=0.2):
   
         deviation = self.compute_deviation_from_path(current_pos)
         penalty = -min(max_penalty, deviation)  # Чем дальше от пути, тем больше штраф
@@ -460,10 +465,17 @@ class TurtleBotEnv(Node, gym.Env):
         cmd_msg.angular.z = angular
 
         prev_xw, prev_yw = self.current_x, self.current_y
+        self.odom_updated = False  # обнуляем флаг
         self.publisher_.publish(cmd_msg)
-        rclpy.spin_once(self, timeout_sec=0.2)
-        time.sleep(0.1)   
-    
+
+        timeout_counter = 0
+        while not self.odom_updated and timeout_counter < 20:
+            rclpy.spin_once(self, timeout_sec=0.05)
+            timeout_counter += 1
+
+        if timeout_counter >= 20:
+            print("Warning: odometry update timeout")
+
         self.steps += 1
         
         # print(self.obstacles)
@@ -476,33 +488,25 @@ class TurtleBotEnv(Node, gym.Env):
         obstacle_detected = self.lidar_obstacle_detected or self.camera_obstacle_detected
         state = np.array([self.current_x, self.current_y, angle_diff, min_obstacle_dist])
 
-        dx, dy = self.current_x - prev_xw, self.current_y - prev_yw
-        disp = np.array([dx, dy])
-        to_goal = np.array([self.target_x - prev_xw, self.target_y - prev_yw])
-        norm = np.linalg.norm(to_goal)
-        to_goal /= norm if norm>0 else 1.0
-        # grad_reward = np.clip(self.lam * np.dot(disp, to_goal), -1.0, 1.0)
-                     # вес 5.0 — подберите по эфиру
-        # distance_rate = (self.past_distance - distance)
-        # print(min_obstacle_dist)
         reward_potent_val = self.compute_potential_reward(state, self.goal, self.optimal_path, obstacle_detected)
         reward_optimal_path = self.get_deviation_penalty(state[:2])
 
-        # if abs(angular) > 0.9:
-        #     spin_penalty = - self.beta_spin * abs(angular)
-        # else:
-        #     spin_penalty = 0
 
         dx = self.current_x - prev_xw
         dy = self.current_y - prev_yw
         disp = np.array([dx, dy])
+        to_goal = np.array([self.target_x - prev_xw, self.target_y - prev_yw])
+        norm = np.linalg.norm(to_goal)
+        to_goal /= norm if norm>0 else 1.0
         dist_forward = np.dot(disp, to_goal)              # скалярная проекция смещения
-        forward_reward = 10.0 * dist_forward
+        forward_reward = 5.0 * dist_forward
         # reward += forward_reward
 
-        # spin_penalty = - self.beta_spin * abs(angular)
+        spin_penalty = - self.beta_spin * abs(angular)
+        logger.info(f"Spin_penalty: {spin_penalty:.2f}")
+
         # Общая награда
-        reward = reward_potent_val + reward_optimal_path + forward_reward - 0.02
+        reward = reward_potent_val + reward_optimal_path + forward_reward + spin_penalty + 0.01
         logger.info(f"Reward_potent_val: {reward_potent_val:.2f}")
         logger.info(f"Reward_optimal_path: {reward_optimal_path:.2f}")
         logger.info(f"Forward_reward: {forward_reward:.2f}")
@@ -520,7 +524,15 @@ class TurtleBotEnv(Node, gym.Env):
 
         # 2. Очень близко к препятствию
         if min_obstacle_dist < 0.3:
-            reward -= 5 * (0.3 - min_obstacle_dist)
+            reward -= 3.0 * (0.3 - min_obstacle_dist)
+
+        if self.wp_index < len(self.optimal_path):
+            wp = self.optimal_path[self.wp_index]
+            d_wp = math.hypot(self.current_x - wp[0], self.current_y - wp[1])
+            if d_wp < self.wp_threshold:
+                print('Int point reached')
+                reward +=30.0
+                self.wp_index += 1
 
         # 3. Достигли цели
         if distance < 0.3:
@@ -536,6 +548,7 @@ class TurtleBotEnv(Node, gym.Env):
 
         # 5. Безопасное ограничение награды
         # tot_reward = np.clip(reward * self.reward_scale, -10.0, 10.0)
+        reward *= 0.01
         logger.info(f"Total_reward: {reward:.2f}")
         return state, reward, done, {}
 
@@ -577,6 +590,8 @@ class TurtleBotEnv(Node, gym.Env):
         self.prev_x = None
         self.prev_y = None
         self.obstacle_count = 0
+        self.wp_index = 0
+        self.odom_updated = False
 
         angle_to_goal = math.atan2(self.target_y - self.current_y, self.target_x - self.current_x)
         angle_diff = (angle_to_goal - self.current_yaw + np.pi) % (2 * np.pi) - np.pi

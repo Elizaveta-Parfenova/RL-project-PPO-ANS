@@ -88,14 +88,14 @@ class PPOAgent:
         # self.obstacles = np.array(env.obstacles, dtype=np.float32)
         # print(self.obstacles)
 
-        # Коэффициенты
+        # Коэффициенты entropy_coef 
         self.gamma = 0.99  # коэффициент дисконтирования
-        self.epsilon = 0.15 # параметр клиппинга
+        self.epsilon = 0.2 # параметр клиппинга
         self.actor_lr = 0.0003
         self.critic_lr = 0.0003
         self.gaelam = 0.95
-        self.min_entropy = 0
-        self.max_entropy = 0.05
+        self.min_entropy = 0.0001
+        self.max_entropy = 0.01
         # self.alpha = 0.1
 
         # Модели
@@ -125,12 +125,12 @@ class PPOAgent:
     
     def get_action(self, state):
         state_tensor = tf.convert_to_tensor(state.reshape(1, -1), dtype=tf.float32)
-        action_raw, log_prob, entropy, std = self.actor(state_tensor, raw_actions = None)
+        action_raw, log_prob, entropy, std, raw_action = self.actor(state_tensor, raw_actions = None)
         action = action_raw.numpy().squeeze()
+        r_action = raw_action.numpy().squeeze()
         logger.info(f"Policy std: {std.numpy().squeeze()}, entropy: {entropy.numpy().squeeze()}")
 
-        return action, log_prob.numpy().squeeze(), entropy.numpy().squeeze()
-    
+        return action, log_prob.numpy().squeeze(), entropy.numpy().squeeze(), std, r_action   
 
     # Вычисление преимущесвт и возврата
     def compute_advantages(self, rewards, values, dones):
@@ -169,24 +169,26 @@ class PPOAgent:
         return advantages, returns 
     
     # Обновление политик
-    def update(self, states, actions, advantages, returns, log_probs_old, entropy_coef):
+    def update(self, states, actions, advantages, returns, log_probs_old, entropy_coef, raw_actions):
         states = tf.convert_to_tensor(states, dtype=tf.float32)
         actions = tf.convert_to_tensor(actions, dtype=tf.float32)
         log_probs_old = tf.convert_to_tensor(log_probs_old, dtype=tf.float32)
         advantages = tf.convert_to_tensor(advantages, dtype=tf.float32)
         returns = tf.convert_to_tensor(returns, dtype=tf.float32)
-
+        raw_actions = tf.convert_to_tensor(raw_actions, dtype=tf.float32)
 
         # === Actor update ===
         with tf.GradientTape() as tape:
-            log_probs, entropy = self.actor(states, training = False, raw_actions = actions)
+            log_probs, entropy = self.actor(states, training = True, raw_actions = raw_actions)
+            log_probs = tf.debugging.check_numerics(log_probs, message="log_probs contain NaN")
             # log_probs = tf.reduce_sum(log_probs, axis=-1)
             ratios = tf.exp(log_probs - log_probs_old)
+            ratios = tf.debugging.check_numerics(ratios, message="ratios contain NaN")
             clipped_ratios = tf.clip_by_value(ratios, 1.0 - self.epsilon, 1.0 + self.epsilon)
             surrogate1 = ratios * advantages
             surrogate2 = clipped_ratios * advantages
             actor_loss = -tf.reduce_mean(tf.minimum(surrogate1, surrogate2))
-
+            print(actor_loss)
             entropy_bonus = tf.reduce_mean(entropy)
 
             actor_loss_full = actor_loss - entropy_coef * entropy_bonus
@@ -197,7 +199,7 @@ class PPOAgent:
         # === Critic update ===
         with tf.GradientTape() as tape:
             
-            values = self.critic.call(states, training = False)  # shape (batch, 1)
+            values = self.critic.call(states, training = True)  # shape (batch, 1)
             critic_loss = tf.reduce_mean(tf.square(returns - values))
 
         critic_grads = tape.gradient(critic_loss, self.critic.trainable_variables)
@@ -207,7 +209,7 @@ class PPOAgent:
         all_rewards = []
         # epsilon_min = 0.01
         # epsilon_decay = 0.99
-        # epsilon = 0.2
+        # epsilon = 0.2q
         episodes_x, avg_y = [], []
         window = 10
         for episode in range(max_episodes):
@@ -216,11 +218,11 @@ class PPOAgent:
             episode_reward = 0
             done = False
 
-            states, actions, rewards, dones, probs = [], [], [], [], []
-            values_learned, values_static = [], []
+            states, actions, rewards, dones, probs, raw_actions = [], [], [], [], [], []
+            values_learned = []
 
             while not done:
-                action, log_prob, _ = self.get_action(state)
+                action, log_prob, _, _, raw_action = self.get_action(state)
                 logger.info(f'Action:  {action}')
                 logger.info(f'Prob:  {log_prob}')
                 next_state, reward, done, _ = self.env.step(action)
@@ -243,6 +245,7 @@ class PPOAgent:
                 dones.append(done)
                 probs.append(log_prob)
                 values_learned.append(value_learned)
+                raw_actions.append(raw_action)
                 # values_static.append(value_static)
 
                 state = next_state
@@ -268,7 +271,7 @@ class PPOAgent:
             advantages, returns = self.compute_advantages(rewards, values_learned, dones)
             entropy_coef = self.update_entropy_coef(episode, max_episodes)
             # Обновляем модель
-            self.update(np.vstack(states), actions, advantages, returns, probs, entropy_coef)
+            self.update(np.vstack(states), actions, advantages, returns, probs, entropy_coef, raw_actions)
 
             all_rewards.append(episode_reward)
 

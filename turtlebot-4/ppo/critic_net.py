@@ -111,75 +111,23 @@ class ImprovedCritic(tf.keras.Model):
         #Если obs не батчевый (например, имеет форму (state_dim,)), добавляем размерность батча
         if len(obs.shape) == 1:
             obs = tf.expand_dims(obs, axis=0)
+        
+        x_norm = tf.identity(obs)
+        x_norm = tf.clip_by_value(x_norm, -10.0, 10.0) / 10.0
+        x_norm = tf.concat([
+            x_norm[:, :2],          # нормализованные x,y
+            obs[:, 2:3] / np.pi,    # угол
+            obs[:, 3:4] / 3.5       # min_obstacle_distance
+        ], axis=-1)
 
-        # Проход через резидуальные блоки
-        x0 = obs
+        x0 = x_norm
         x = self.rb1(x0, final_nl=True)
         x = self.rb2(tf.concat([x0, x], axis=-1), final_nl=True)
         x = self.dropout(x, training=training)
         output = self.out(x)
+   
         return output
     
-    # def eval_value(self, state, grid_map):
-    #     """
-    #     Оценивает значение состояния (работает с первым образцом, если state – батч)
-    #     :param state: вектор состояния или батч состояний
-    #     :return: оценка ценности
-    #     """
-        
-    #     # print(len(state))
-    #     # Если state является батчем, берём первый элемент
-    #     if state.ndim == 2 and state.shape[0] == 1:
-    #         state = state[0]
-
-        
-    #     state_sample = [state[0], state[1]]
-    #     st = [state[2], state[3]]
-    #     state_sample = world_to_map(state_sample, resolution = 0.05, origin = (-4.86, -7.36),  map_offset = (45, 15), map_shape = grid_map.shape)
-        
-    #     # Предполагаем, что первые два элемента вектора – координаты (x, y)
-    #     # Приводим их к числам для работы с numpy
-    #     current_pos = (float(state_sample[0].numpy()) if hasattr(state_sample[0], 'numpy') else float(state_sample[0]),
-    #                    float(state_sample[1].numpy()) if hasattr(state_sample[1], 'numpy') else float(state_sample[1]))
-    #     deviation = compute_deviation_from_path(current_pos, self.optimal_path)
-    #     self.deviation_list.append(deviation)
-    #     # Определяем штраф за столкновение
-    #     collision_penalty = 0
-    #     if self.is_near_obstacle(current_pos):
-    #         assert isinstance(collision_penalty, (int, float))
-    #         collision_penalty = 10 # Значительный штраф за приближение к препятствию
-    #     self.penality_list.append(collision_penalty)
-    #     state = tf.concat([
-    #     tf.convert_to_tensor(state_sample, dtype=tf.float32),  # Пиксельные координаты
-    #     tf.convert_to_tensor(st, dtype=tf.float32)             # Доп. параметры
-    #     ], axis=-1)
-
-    #     # print(state)
-    #     return self.call(state, deviation, collision_penalty)
-
-    
-    # def is_near_obstacle(self, point, safe_distance=2):
-    #     """
-    #     Проверяет, находится ли точка рядом с препятствием на карте.
-    #     :param point: координаты точки (x, y)
-    #     :param safe_distance: радиус проверки вокруг точки
-    #     :return: True, если в области обнаружено препятствие
-    #     """
-    #     x, y = int(round(point[0])), int(round(point[1]))
-    #     h, w = self.grid_map.shape
-
-    #     if x < 0 or y < 0 or x >= w or y >= h:
-    #         return True
-
-    #     # Определяем границы области проверки (учитываем, что срез в numpy не включает правую границу)
-    #     x_min = max(0, x - safe_distance)
-    #     x_max = min(w, x + safe_distance + 1)
-    #     y_min = max(0, y - safe_distance)
-    #     y_max = min(h, y + safe_distance + 1)
-
-    #     area = self.grid_map[y_min:y_max, x_min:x_max]
-    #     return np.any(area == 1)
-
 
 class StaticCritic:
     def __init__(self, value_map, grid_map):
